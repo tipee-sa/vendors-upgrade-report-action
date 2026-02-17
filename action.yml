@@ -1,0 +1,105 @@
+name: 'Vendors Upgrade Report'
+description: 'Generates changelog reports for upgraded Composer and Yarn packages and posts them as PR comments, grouped by vendor.'
+
+branding:
+  icon: 'package'
+  color: 'blue'
+
+inputs:
+  token:
+    description: 'GitHub token for API access and posting PR comments.'
+    default: ${{ github.token }}
+  base-ref:
+    description: 'Git ref to compare against (e.g., "origin/main"). Defaults to the PR base branch.'
+    required: false
+  composer-lock:
+    description: 'Path to composer.lock. Use "auto" to detect from PR diff, or "none" to skip.'
+    default: 'auto'
+  yarn-lock-files:
+    description: 'JSON array of yarn.lock paths (e.g., ''["react/yarn.lock"]''), "auto" to detect from PR diff, or "none" to skip.'
+    default: 'auto'
+
+runs:
+  using: 'composite'
+  steps:
+    - uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.5'
+        extensions: curl
+        coverage: none
+      env:
+        fail-fast: true
+
+    - name: Fetch base branch
+      id: base
+      shell: bash
+      run: |
+        INPUT_BASE_REF='${{ inputs.base-ref }}'
+        if [ -n "$INPUT_BASE_REF" ]; then
+          BASE_REF="$INPUT_BASE_REF"
+        elif [ -n "${{ github.event.pull_request.base.ref }}" ]; then
+          BASE_REF="origin/${{ github.event.pull_request.base.ref }}"
+        else
+          echo "::error::base-ref input is required when not running in a pull_request context"
+          exit 1
+        fi
+
+        # Fetch the base branch tip so git diff/show work without fetch-depth: 0
+        BRANCH="${BASE_REF#origin/}"
+        git fetch --depth=1 origin "$BRANCH" 2>/dev/null || true
+
+        echo "base_ref=$BASE_REF" >> "$GITHUB_OUTPUT"
+        echo "Base ref: $BASE_REF"
+
+    - name: Detect lock files
+      id: detect
+      shell: bash
+      run: |
+        BASE_REF='${{ steps.base.outputs.base_ref }}'
+
+        # Composer lock detection
+        COMPOSER_LOCK='${{ inputs.composer-lock }}'
+        if [ "$COMPOSER_LOCK" = "auto" ]; then
+          if git diff --name-only "$BASE_REF..HEAD" | grep -q '^composer\.lock$'; then
+            COMPOSER_LOCK="composer.lock"
+          else
+            COMPOSER_LOCK=""
+          fi
+        elif [ "$COMPOSER_LOCK" = "none" ]; then
+          COMPOSER_LOCK=""
+        fi
+        echo "composer_lock=$COMPOSER_LOCK" >> "$GITHUB_OUTPUT"
+
+        # Yarn lock detection
+        YARN_INPUT='${{ inputs.yarn-lock-files }}'
+        if [ "$YARN_INPUT" = "auto" ]; then
+          YARN_FILES=$(git diff --name-only "$BASE_REF..HEAD" | grep 'yarn\.lock$' | grep -v node_modules || true)
+          if [ -n "$YARN_FILES" ]; then
+            YARN_JSON=$(echo "$YARN_FILES" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          else
+            YARN_JSON="[]"
+          fi
+        elif [ "$YARN_INPUT" = "none" ]; then
+          YARN_JSON="[]"
+        else
+          YARN_JSON="$YARN_INPUT"
+        fi
+        echo "yarn_lock_files=$YARN_JSON" >> "$GITHUB_OUTPUT"
+
+        echo "Composer lock: $COMPOSER_LOCK"
+        echo "Yarn lock files: $YARN_JSON"
+
+    - name: Generate and post reports
+      if: steps.detect.outputs.composer_lock != '' || steps.detect.outputs.yarn_lock_files != '[]'
+      uses: actions/github-script@v7
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        PHP_SCRIPT: ${{ github.action_path }}/bin/vendors-upgrade-report
+        COMPOSER_LOCK: ${{ steps.detect.outputs.composer_lock }}
+        YARN_LOCK_FILES: ${{ steps.detect.outputs.yarn_lock_files }}
+        BASE_REF: ${{ steps.base.outputs.base_ref }}
+      with:
+        github-token: ${{ inputs.token }}
+        script: |
+          const report = require('${{ github.action_path }}/src/report.js');
+          await report({ github, context, core });

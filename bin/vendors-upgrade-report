@@ -1,0 +1,1052 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Package Upgrade Report Generator
+ *
+ * Generates a markdown report with GitHub release notes and compare URLs
+ * for upgraded Composer or Yarn packages.
+ *
+ * Symfony packages are grouped and their changelogs are fetched from the
+ * symfony/symfony monorepo releases for a compact overview.
+ *
+ * Usage:
+ *   # From a package list (stdin, Composer only)
+ *   composer update 2>&1 | php bin/vendors-upgrade-report
+ *   php bin/vendors-upgrade-report < packages.txt > report.md
+ *
+ *   # From two composer.lock files
+ *   php bin/vendors-upgrade-report --from-lock old-composer.lock composer.lock
+ *   php bin/vendors-upgrade-report --from-lock <(git show HEAD~1:composer.lock) composer.lock
+ *
+ *   # From two yarn.lock files
+ *   php bin/vendors-upgrade-report --from-yarn-lock old-yarn.lock react/yarn.lock
+ *   php bin/vendors-upgrade-report --from-yarn-lock <(git show HEAD~1:react/yarn.lock) react/yarn.lock
+ *
+ * Options:
+ *   --from-lock       Compare two composer.lock files instead of reading a package list from stdin
+ *   --from-yarn-lock  Compare two yarn.lock files instead of reading a package list from stdin
+ *
+ * Input format when using stdin (one per line):
+ *   - vendor/package (v1.0.0 => v2.0.0)
+ *
+ * Requires: GH_TOKEN or GITHUB_TOKEN env var, or gh CLI (https://cli.github.com/) for authenticated
+ * GitHub API access. Falls back to unauthenticated API calls (rate-limited to 60 req/hour) otherwise.
+ */
+
+// Only execute when run directly (not when required by tests)
+if (realpath($argv[0] ?? '') === realpath(__FILE__)) {
+    $fromLock = in_array('--from-lock', $argv, true);
+    $fromYarnLock = in_array('--from-yarn-lock', $argv, true);
+
+    if ($fromYarnLock) {
+        $upgrades = parseFromYarnLockFiles($argv);
+        $packageRegistry = 'npm';
+    } elseif ($fromLock) {
+        $upgrades = parseFromLockFiles($argv);
+        $packageRegistry = 'composer';
+    } else {
+        $input = stream_get_contents(STDIN);
+        $upgrades = ($input !== false && trim($input) !== '') ? parseUpgrades($input) : [];
+        $packageRegistry = 'composer';
+    }
+
+    if (empty($upgrades)) {
+        stderr("Package Upgrade Report Generator\n\n");
+        stderr("Usage:\n");
+        stderr("  composer update 2>&1 | php bin/vendors-upgrade-report\n");
+        stderr("  php bin/vendors-upgrade-report < packages.txt > report.md\n");
+        stderr("  php bin/vendors-upgrade-report --from-lock old.lock new.lock\n");
+        stderr("  php bin/vendors-upgrade-report --from-yarn-lock old.lock new.lock\n\n");
+        stderr("Options:\n");
+        stderr("  --from-lock       Compare two composer.lock files\n");
+        stderr("  --from-yarn-lock  Compare two yarn.lock files\n\n");
+        stderr("Input format for stdin (one per line):\n");
+        stderr("  - vendor/package (v1.0.0 => v2.0.0)\n");
+        exit(1);
+    }
+
+    $githubToken = resolveGitHubToken();
+    if ($githubToken === null) {
+        stderr("Warning: No GitHub token found. API calls will be unauthenticated and rate-limited (60 req/hour).\n");
+        stderr("Set GH_TOKEN or GITHUB_TOKEN env var, or install gh CLI: https://cli.github.com/\n\n");
+    }
+
+    if (!function_exists('curl_multi_init')) {
+        stderr("Warning: curl extension not available, HTTP requests will be sequential.\n\n");
+    }
+
+    stderr(sprintf("Processing %d package upgrade(s)...\n\n", count($upgrades)));
+
+    echo generateReport($upgrades, $githubToken, $packageRegistry);
+}
+
+// === Utility Functions ===
+
+function stderr(string $message): void
+{
+    fwrite(STDERR, $message);
+}
+
+function resolveGitHubToken(): ?string
+{
+    $token = getenv('GH_TOKEN');
+    if ($token !== false && $token !== '') {
+        return $token;
+    }
+
+    $token = getenv('GITHUB_TOKEN');
+    if ($token !== false && $token !== '') {
+        return $token;
+    }
+
+    $ghPath = trim((string) shell_exec('which gh 2>/dev/null'));
+    if ($ghPath !== '') {
+        $token = trim((string) shell_exec('gh auth token 2>/dev/null'));
+        if ($token !== '') {
+            return $token;
+        }
+    }
+
+    return null;
+}
+
+function githubApiHeaders(?string $token): array
+{
+    $headers = ['Accept: application/vnd.github.v3+json'];
+
+    if ($token !== null) {
+        $headers[] = sprintf('Authorization: Bearer %s', $token);
+    }
+
+    return $headers;
+}
+
+// === HTTP Functions ===
+
+/**
+ * Performs parallel HTTP GET requests using curl_multi.
+ *
+ * @param array<string, array{url: string, headers?: string[], timeout?: int}> $requests
+ * @return array<string, string|false> Body on success, false on failure/404
+ */
+function curlMultiGet(array $requests, int $maxRetries = 3): array
+{
+    if (empty($requests)) {
+        return [];
+    }
+
+    if (!function_exists('curl_multi_init')) {
+        return curlMultiGetSequential($requests, $maxRetries);
+    }
+
+    $results = [];
+    $pending = $requests;
+
+    for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
+        $mh = curl_multi_init();
+        $handles = [];
+
+        foreach ($pending as $key => $req) {
+            $ch = curl_init($req['url']);
+            curl_setopt_array($ch, [
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_FOLLOWLOCATION => true,
+                CURLOPT_HTTPHEADER => array_merge(
+                    ['User-Agent: vendors-upgrade-report'],
+                    $req['headers'] ?? [],
+                ),
+                CURLOPT_TIMEOUT => $req['timeout'] ?? 10,
+                CURLOPT_CONNECTTIMEOUT => 5,
+            ]);
+            curl_multi_add_handle($mh, $ch);
+            $handles[$key] = $ch;
+        }
+
+        do {
+            $status = curl_multi_exec($mh, $active);
+            if ($active) {
+                curl_multi_select($mh, 1.0);
+            }
+        } while ($active && $status === CURLM_OK);
+
+        $retry = [];
+        foreach ($handles as $key => $ch) {
+            $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $error = curl_errno($ch);
+            $body = curl_multi_getcontent($ch);
+
+            if ($error !== 0) {
+                $retry[$key] = $pending[$key];
+            } elseif ($httpCode === 404) {
+                $results[$key] = false;
+            } elseif ($httpCode >= 500 || $httpCode === 429 || $httpCode === 403) {
+                $retry[$key] = $pending[$key];
+            } elseif ($httpCode >= 200 && $httpCode < 300) {
+                $results[$key] = $body;
+            } else {
+                $results[$key] = false;
+            }
+
+            curl_multi_remove_handle($mh, $ch);
+            curl_close($ch);
+        }
+
+        curl_multi_close($mh);
+
+        if (empty($retry)) {
+            break;
+        }
+
+        if ($attempt === $maxRetries) {
+            foreach ($retry as $key => $_) {
+                $results[$key] = false;
+            }
+            break;
+        }
+
+        $backoff = $attempt + 1;
+        stderr(sprintf("  Retrying %d request(s) in %ds...\n", count($retry), $backoff));
+        sleep($backoff);
+        $pending = $retry;
+    }
+
+    return $results;
+}
+
+/**
+ * Sequential fallback for curlMultiGet when curl extension is not available.
+ */
+function curlMultiGetSequential(array $requests, int $maxRetries = 3): array
+{
+    $results = [];
+
+    foreach ($requests as $key => $req) {
+        $headerStr = 'User-Agent: vendors-upgrade-report';
+        if (!empty($req['headers'])) {
+            $headerStr .= "\r\n" . implode("\r\n", $req['headers']);
+        }
+
+        $context = stream_context_create(['http' => [
+            'timeout' => $req['timeout'] ?? 10,
+            'header' => $headerStr,
+            'ignore_errors' => true,
+        ]]);
+
+        $results[$key] = false;
+
+        for ($attempt = 1; $attempt <= $maxRetries; $attempt++) {
+            $body = @file_get_contents($req['url'], false, $context);
+            $httpCode = 0;
+
+            if (isset($http_response_header)) {
+                foreach ($http_response_header as $header) {
+                    if (preg_match('/^HTTP\/\S+ (\d+)/', $header, $m)) {
+                        $httpCode = (int) $m[1];
+                    }
+                }
+            }
+
+            if ($httpCode === 404) {
+                break;
+            }
+
+            if ($httpCode >= 200 && $httpCode < 300 && $body !== false) {
+                $results[$key] = $body;
+                break;
+            }
+
+            if ($httpCode >= 500 || $httpCode === 429 || $httpCode === 403 || $body === false) {
+                if ($attempt < $maxRetries) {
+                    sleep($attempt + 1);
+                }
+                continue;
+            }
+
+            break;
+        }
+    }
+
+    return $results;
+}
+
+// === Input Parsing Functions ===
+
+function parseUpgrades(string $input): array
+{
+    preg_match_all(
+        '/([a-z0-9](?:[a-z0-9._-]*[a-z0-9])?\/[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?)\s+\(v?([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)\s*=>\s*v?([\d]+(?:\.[\d]+)*(?:-[\w.]+)?)\)/i',
+        $input,
+        $matches,
+        PREG_SET_ORDER,
+    );
+
+    $upgrades = [];
+    foreach ($matches as $match) {
+        $upgrades[] = [
+            'package' => $match[1],
+            'from' => $match[2],
+            'to' => $match[3],
+        ];
+    }
+
+    return $upgrades;
+}
+
+function parseFromLockFiles(array $argv): array
+{
+    // Extract non-flag arguments (skip script name and flags)
+    $files = [];
+    foreach (array_slice($argv, 1) as $arg) {
+        if (!str_starts_with($arg, '--')) {
+            $files[] = $arg;
+        }
+    }
+
+    if (count($files) !== 2) {
+        stderr("Error: --from-lock requires exactly 2 arguments: old-lock-file new-lock-file\n");
+        stderr("Example: php bin/vendors-upgrade-report --from-lock old.lock composer.lock\n");
+        exit(1);
+    }
+
+    [$oldFile, $newFile] = $files;
+
+    $oldLock = json_decode(file_get_contents($oldFile), true);
+    $newLock = json_decode(file_get_contents($newFile), true);
+
+    if ($oldLock === null || $newLock === null) {
+        stderr(sprintf("Error: Could not parse lock files (%s, %s)\n", $oldFile, $newFile));
+        exit(1);
+    }
+
+    $oldPackages = [];
+    foreach (array_merge($oldLock['packages'] ?? [], $oldLock['packages-dev'] ?? []) as $p) {
+        $oldPackages[$p['name']] = ltrim($p['version'], 'v');
+    }
+
+    $upgrades = [];
+    foreach (array_merge($newLock['packages'] ?? [], $newLock['packages-dev'] ?? []) as $p) {
+        $name = $p['name'];
+        $newVersion = ltrim($p['version'], 'v');
+        $oldVersion = $oldPackages[$name] ?? null;
+
+        if ($oldVersion !== null && $oldVersion !== $newVersion && version_compare($oldVersion, $newVersion, '<')) {
+            $upgrades[] = [
+                'package' => $name,
+                'from' => $oldVersion,
+                'to' => $newVersion,
+            ];
+        }
+    }
+
+    return $upgrades;
+}
+
+function parseFromYarnLockFiles(array $argv): array
+{
+    // Extract non-flag arguments (skip script name and flags)
+    $files = [];
+    foreach (array_slice($argv, 1) as $arg) {
+        if (!str_starts_with($arg, '--')) {
+            $files[] = $arg;
+        }
+    }
+
+    if (count($files) !== 2) {
+        stderr("Error: --from-yarn-lock requires exactly 2 arguments: old-lock-file new-lock-file\n");
+        stderr("Example: php bin/vendors-upgrade-report --from-yarn-lock old.lock react/yarn.lock\n");
+        exit(1);
+    }
+
+    [$oldFile, $newFile] = $files;
+
+    $oldContent = file_get_contents($oldFile);
+    $newContent = file_get_contents($newFile);
+
+    if ($oldContent === false || $newContent === false) {
+        stderr(sprintf("Error: Could not read yarn.lock file(s) (%s, %s)\n", $oldFile, $newFile));
+        exit(1);
+    }
+
+    $oldPackages = parseYarnLock($oldContent, $oldFile);
+    $newPackages = parseYarnLock($newContent, $newFile);
+
+    $upgrades = [];
+    foreach ($newPackages as $name => $newVersion) {
+        $oldVersion = $oldPackages[$name] ?? null;
+
+        if ($oldVersion !== null && $oldVersion !== $newVersion && version_compare($oldVersion, $newVersion, '<')) {
+            $upgrades[] = [
+                'package' => $name,
+                'from' => $oldVersion,
+                'to' => $newVersion,
+            ];
+        }
+    }
+
+    return $upgrades;
+}
+
+/**
+ * Parses a yarn.lock v1 file and returns [package_name => version].
+ *
+ * When multiple entries resolve to different versions of the same package,
+ * the highest version wins (this matches what yarn actually installs).
+ */
+function parseYarnLock(string $content, string $filename): array
+{
+    if (trim($content) === '') {
+        stderr(sprintf("Error: Empty yarn.lock file: %s\n", $filename));
+        exit(1);
+    }
+
+    $packages = [];
+
+    // Match entry headers like: "package@spec", "package@other-spec":
+    // Followed by: version "X.Y.Z"
+    preg_match_all(
+        '/^"?([^"\n]+)"?:\n\s+version\s+"([^"]+)"/m',
+        $content,
+        $matches,
+        PREG_SET_ORDER,
+    );
+
+    foreach ($matches as $match) {
+        $specList = $match[1];
+        $version = $match[2];
+
+        // The header can be a comma-separated list of "pkg@spec" entries.
+        // Extract the package name from the first one.
+        // For scoped packages like @scope/name@^1.0.0, the name is everything before the last @.
+        $firstSpec = explode(',', $specList)[0];
+        $firstSpec = trim($firstSpec, '" ');
+
+        $lastAt = strrpos($firstSpec, '@');
+        if ($lastAt === false || $lastAt === 0) {
+            continue;
+        }
+
+        $name = substr($firstSpec, 0, $lastAt);
+
+        // Keep the highest version when multiple entries exist for the same package
+        if (!isset($packages[$name]) || version_compare($packages[$name], $version, '<')) {
+            $packages[$name] = $version;
+        }
+    }
+
+    return $packages;
+}
+
+// === Package Registry Functions ===
+
+function parsePackagistResponse(string $json, string $package): ?array
+{
+    $data = json_decode($json, true);
+    if (!is_array($data) || !isset($data['packages'][$package])) {
+        return null;
+    }
+
+    $versions = $data['packages'][$package];
+
+    // Find the GitHub repo from source URL, falling back to support URLs
+    $repo = null;
+    $candidateUrls = array_filter([
+        $versions[0]['source']['url'] ?? '',
+        $versions[0]['support']['issues'] ?? '',
+        $versions[0]['support']['source'] ?? '',
+    ]);
+
+    foreach ($candidateUrls as $candidateUrl) {
+        if (preg_match('#github\.com[:/]([^/]+/[^/.]+?)(?:\.git)?(?:/[^)]*)?$#', $candidateUrl, $m)) {
+            $repo = $m[1];
+            break;
+        }
+    }
+
+    // Detect tag prefix (v or empty) from the first stable version string
+    $tagPrefix = '';
+    foreach ($versions as $version) {
+        $vStr = $version['version'] ?? '';
+        if (!str_contains($vStr, 'dev') && preg_match('/^v?\d/', $vStr)) {
+            $tagPrefix = str_starts_with($vStr, 'v') ? 'v' : '';
+            break;
+        }
+    }
+
+    return [
+        'repo' => $repo,
+        'tagPrefix' => $tagPrefix,
+    ];
+}
+
+function parseNpmResponse(string $json): ?array
+{
+    $data = json_decode($json, true);
+    if (!is_array($data)) {
+        return null;
+    }
+
+    $repoUrl = $data['repository']['url'] ?? '';
+    $repo = null;
+
+    // Repository URL is typically "git+https://github.com/owner/repo.git" or "https://github.com/owner/repo.git"
+    if (preg_match('#github\.com[:/]([^/]+/[^/.]+?)(?:\.git)?$#', $repoUrl, $m)) {
+        $repo = $m[1];
+    }
+
+    return [
+        'repo' => $repo,
+        'tagPrefix' => 'v',
+    ];
+}
+
+/**
+ * Fetches package info for all packages in a single parallel batch.
+ *
+ * @return array<string, ?array{repo: ?string, tagPrefix: string}> Keyed by package name
+ */
+function batchFetchPackageInfo(array $upgrades, string $registry): array
+{
+    $requests = [];
+    $seen = [];
+
+    foreach ($upgrades as $upgrade) {
+        $package = $upgrade['package'];
+        if (isset($seen[$package])) {
+            continue;
+        }
+        $seen[$package] = true;
+
+        if ($registry === 'npm') {
+            $requests[$package] = [
+                'url' => sprintf('https://registry.npmjs.org/%s', $package),
+                'timeout' => 10,
+            ];
+        } else {
+            $requests[$package] = [
+                'url' => sprintf('https://repo.packagist.org/p2/%s.json', $package),
+                'timeout' => 10,
+            ];
+        }
+    }
+
+    $responses = curlMultiGet($requests);
+
+    $result = [];
+    foreach ($responses as $package => $body) {
+        if ($body === false) {
+            $result[$package] = null;
+            continue;
+        }
+
+        $result[$package] = $registry === 'npm'
+            ? parseNpmResponse($body)
+            : parsePackagistResponse($body, $package);
+    }
+
+    return $result;
+}
+
+// === GitHub Functions ===
+
+/**
+ * Fetches GitHub releases for multiple repos in parallel, with iterative paging.
+ *
+ * Batch-fetches page 1 for all repos, then page 2 for repos that need more, etc.
+ *
+ * @param array<string, string> $repoOldestVersions [repo => oldestNeededVersion]
+ * @return array<string, array> [repo => [release, ...]]
+ */
+function batchFetchReleases(array $repoOldestVersions, ?string $githubToken): array
+{
+    if (empty($repoOldestVersions)) {
+        return [];
+    }
+
+    $headers = githubApiHeaders($githubToken);
+    $allReleases = [];
+    $reposNeedingMore = $repoOldestVersions;
+
+    for ($page = 1; $page <= 5 && !empty($reposNeedingMore); $page++) {
+        $requests = [];
+        foreach ($reposNeedingMore as $repo => $oldest) {
+            $requests[$repo] = [
+                'url' => sprintf('https://api.github.com/repos/%s/releases?per_page=100&page=%d', $repo, $page),
+                'headers' => $headers,
+                'timeout' => 15,
+            ];
+        }
+
+        stderr(sprintf("  Page %d: %d repo(s)...\n", $page, count($requests)));
+        $responses = curlMultiGet($requests);
+
+        $reposNeedingMore = [];
+
+        foreach ($responses as $repo => $body) {
+            if ($body === false) {
+                continue;
+            }
+
+            $pageReleases = json_decode($body, true);
+            if (!is_array($pageReleases) || empty($pageReleases)) {
+                continue;
+            }
+
+            if (!isset($allReleases[$repo])) {
+                $allReleases[$repo] = [];
+            }
+
+            $foundOlder = false;
+            foreach ($pageReleases as $release) {
+                $allReleases[$repo][] = $release;
+                $tag = ltrim($release['tag_name'], 'v');
+                if (version_compare($tag, $repoOldestVersions[$repo], '<=')) {
+                    $foundOlder = true;
+                }
+            }
+
+            if (!$foundOlder) {
+                $reposNeedingMore[$repo] = $repoOldestVersions[$repo];
+            }
+        }
+    }
+
+    return $allReleases;
+}
+
+/**
+ * Filters releases to those within (from, to] range, sorted by version ascending.
+ */
+function filterReleasesInRange(array $releases, string $from, string $to): array
+{
+    $filtered = [];
+    foreach ($releases as $release) {
+        $tag = ltrim($release['tag_name'], 'v');
+        if (version_compare($tag, $from, '>') && version_compare($tag, $to, '<=')) {
+            $filtered[] = $release;
+        }
+    }
+
+    usort($filtered, static fn(array $a, array $b): int => version_compare(
+        ltrim($a['tag_name'], 'v'),
+        ltrim($b['tag_name'], 'v'),
+    ));
+
+    return $filtered;
+}
+
+/**
+ * Fetches changelog URLs for multiple repos in a single parallel batch.
+ *
+ * Tries 6 filename candidates per repo (CHANGELOG.md, .txt, CHANGELOG, CHANGES.md, .txt, CHANGES)
+ * and returns the first hit per repo.
+ *
+ * @param string[] $repos
+ * @return array<string, string> [repo => changelog_url]
+ */
+function batchFetchChangelogUrls(array $repos, ?string $githubToken): array
+{
+    if (empty($repos)) {
+        return [];
+    }
+
+    $candidates = ['CHANGELOG.md', 'CHANGELOG.txt', 'CHANGELOG', 'CHANGES.md', 'CHANGES.txt', 'CHANGES'];
+    $headers = githubApiHeaders($githubToken);
+
+    $requests = [];
+    foreach ($repos as $repo) {
+        foreach ($candidates as $i => $filename) {
+            $key = sprintf('%s|%d', $repo, $i);
+            $requests[$key] = [
+                'url' => sprintf('https://api.github.com/repos/%s/contents/%s', $repo, $filename),
+                'headers' => $headers,
+                'timeout' => 5,
+            ];
+        }
+    }
+
+    $responses = curlMultiGet($requests);
+
+    $result = [];
+    foreach ($repos as $repo) {
+        foreach ($candidates as $i => $filename) {
+            $key = sprintf('%s|%d', $repo, $i);
+            $body = $responses[$key] ?? false;
+
+            if ($body !== false) {
+                $data = json_decode($body, true);
+                $url = $data['html_url'] ?? null;
+                if ($url !== null && str_starts_with($url, 'https://')) {
+                    $result[$repo] = $url;
+                    break;
+                }
+            }
+        }
+    }
+
+    return $result;
+}
+
+// === Report Functions ===
+
+/**
+ * Extracts the vendor/scope from a package name.
+ *
+ * Composer: "vendor/package" => "vendor"
+ * NPM scoped: "@scope/package" => "@scope"
+ * NPM unscoped: "package" => "package"
+ */
+function getVendorName(string $package): string
+{
+    return explode('/', $package)[0];
+}
+
+/**
+ * Rewrites relative markdown links in release bodies to absolute GitHub URLs.
+ *
+ * Release notes often contain relative links like [CHANGELOG](CHANGELOG.md) which
+ * resolve correctly on the GitHub release page but break when embedded in a PR comment
+ * on a different repository.
+ */
+function resolveRelativeUrls(string $markdown, string $repo, string $tag): string
+{
+    return preg_replace_callback(
+        '/\[([^\]]+)\]\((?!https?:\/\/|#|mailto:)([^)]+)\)/',
+        static fn(array $m): string => sprintf(
+            '[%s](https://github.com/%s/blob/%s/%s)',
+            $m[1],
+            $repo,
+            $tag,
+            ltrim($m[2], '/'),
+        ),
+        $markdown,
+    );
+}
+
+function generateReport(array $upgrades, ?string $githubToken, string $packageRegistry = 'composer'): string
+{
+    // Group upgrades by vendor
+    $vendors = [];
+    foreach ($upgrades as $upgrade) {
+        $vendor = getVendorName($upgrade['package']);
+        $vendors[$vendor][] = $upgrade;
+    }
+    ksort($vendors);
+
+    // Pre-compute symfony groupings (groups of >=3 packages per major.minor use monorepo)
+    $symfonyByMajorMinor = [];
+    $groupedSymfonyPackages = [];
+    if ($packageRegistry === 'composer' && isset($vendors['symfony'])) {
+        foreach ($vendors['symfony'] as $upgrade) {
+            preg_match('/^(\d+\.\d+)\./', $upgrade['to'], $m);
+            $majorMinor = $m[1] ?? 'unknown';
+            $symfonyByMajorMinor[$majorMinor][] = $upgrade;
+        }
+        foreach ($symfonyByMajorMinor as $groupUpgrades) {
+            if (count($groupUpgrades) >= 3) {
+                foreach ($groupUpgrades as $u) {
+                    $groupedSymfonyPackages[$u['package']] = true;
+                }
+            }
+        }
+    }
+
+    // Phase 1: Batch fetch package registry info
+    stderr("Phase 1: Fetching package registry info...\n");
+    $startTime = microtime(true);
+    $packageInfoMap = batchFetchPackageInfo($upgrades, $packageRegistry);
+    stderr(sprintf("  %d package(s) fetched in %.1fs\n\n", count($packageInfoMap), microtime(true) - $startTime));
+
+    // Build repo -> oldest needed version map for release fetching
+    $repoOldestVersions = [];
+
+    // Add symfony/symfony monorepo for grouped symfony packages
+    foreach ($symfonyByMajorMinor as $groupUpgrades) {
+        if (count($groupUpgrades) >= 3) {
+            $allFromVersions = array_column($groupUpgrades, 'from');
+            usort($allFromVersions, 'version_compare');
+            $oldest = $allFromVersions[0];
+
+            if (!isset($repoOldestVersions['symfony/symfony'])
+                || version_compare($oldest, $repoOldestVersions['symfony/symfony'], '<')) {
+                $repoOldestVersions['symfony/symfony'] = $oldest;
+            }
+        }
+    }
+
+    // Add individual package repos (skip grouped symfony, they use the monorepo)
+    foreach ($upgrades as $upgrade) {
+        if (isset($groupedSymfonyPackages[$upgrade['package']])) {
+            continue;
+        }
+        $info = $packageInfoMap[$upgrade['package']] ?? null;
+        if ($info !== null && $info['repo'] !== null) {
+            $repo = $info['repo'];
+            if (!isset($repoOldestVersions[$repo])
+                || version_compare($upgrade['from'], $repoOldestVersions[$repo], '<')) {
+                $repoOldestVersions[$repo] = $upgrade['from'];
+            }
+        }
+    }
+
+    // Phase 2: Batch fetch GitHub releases
+    stderr(sprintf("Phase 2: Fetching GitHub releases for %d repo(s)...\n", count($repoOldestVersions)));
+    $startTime = microtime(true);
+    $allReleases = batchFetchReleases($repoOldestVersions, $githubToken);
+    stderr(sprintf("  Done in %.1fs\n\n", microtime(true) - $startTime));
+
+    // Determine which repos need changelog URLs (individual packages with no releases in range)
+    $reposNeedingChangelog = [];
+    foreach ($upgrades as $upgrade) {
+        if (isset($groupedSymfonyPackages[$upgrade['package']])) {
+            continue;
+        }
+        $info = $packageInfoMap[$upgrade['package']] ?? null;
+        if ($info === null || $info['repo'] === null) {
+            continue;
+        }
+        $repo = $info['repo'];
+        if (isset($reposNeedingChangelog[$repo])) {
+            continue;
+        }
+        $releases = filterReleasesInRange($allReleases[$repo] ?? [], $upgrade['from'], $upgrade['to']);
+        if (empty($releases)) {
+            $reposNeedingChangelog[$repo] = true;
+        }
+    }
+
+    // Phase 3: Batch fetch changelog URLs
+    $changelogUrls = [];
+    if (!empty($reposNeedingChangelog)) {
+        stderr(sprintf("Phase 3: Fetching changelog URLs for %d repo(s)...\n", count($reposNeedingChangelog)));
+        $startTime = microtime(true);
+        $changelogUrls = batchFetchChangelogUrls(array_keys($reposNeedingChangelog), $githubToken);
+        stderr(sprintf("  Done in %.1fs\n\n", microtime(true) - $startTime));
+    }
+
+    // Phase 4: Assemble report
+    $report = '';
+    $total = count($upgrades);
+    $current = 0;
+
+    foreach ($vendors as $vendor => $vendorUpgrades) {
+        $packageCount = count($vendorUpgrades);
+        $report .= sprintf("<!-- vendor-section:%s -->\n", $vendor);
+        $report .= sprintf("# %s (%d %s)\n\n", $vendor, $packageCount, $packageCount === 1 ? 'package' : 'packages');
+
+        // Symfony framework packages use the monorepo approach
+        if ($packageRegistry === 'composer' && $vendor === 'symfony') {
+            foreach ($symfonyByMajorMinor as $majorMinor => $groupUpgrades) {
+                if (count($groupUpgrades) >= 3) {
+                    $allFromVersions = array_column($groupUpgrades, 'from');
+                    $allToVersions = array_column($groupUpgrades, 'to');
+                    usort($allFromVersions, 'version_compare');
+                    usort($allToVersions, 'version_compare');
+                    $maxFrom = end($allFromVersions);
+                    $maxTo = end($allToVersions);
+
+                    $releases = filterReleasesInRange(
+                        $allReleases['symfony/symfony'] ?? [],
+                        $maxFrom,
+                        $maxTo,
+                    );
+
+                    $report .= generateSymfonyFrameworkDetails(
+                        $groupUpgrades,
+                        $majorMinor,
+                        $releases,
+                        $total,
+                        $current,
+                    );
+                    $current += count($groupUpgrades);
+                } else {
+                    foreach ($groupUpgrades as $upgrade) {
+                        $current++;
+                        $info = $packageInfoMap[$upgrade['package']] ?? null;
+                        $releases = [];
+                        $changelogUrl = null;
+
+                        if ($info !== null && $info['repo'] !== null) {
+                            $releases = filterReleasesInRange(
+                                $allReleases[$info['repo']] ?? [],
+                                $upgrade['from'],
+                                $upgrade['to'],
+                            );
+                            if (empty($releases)) {
+                                $changelogUrl = $changelogUrls[$info['repo']] ?? null;
+                            }
+                        }
+
+                        $report .= generatePackageDetails($upgrade, $info, $releases, $changelogUrl, $current, $total);
+                    }
+                }
+            }
+        } else {
+            foreach ($vendorUpgrades as $upgrade) {
+                $current++;
+                $info = $packageInfoMap[$upgrade['package']] ?? null;
+                $releases = [];
+                $changelogUrl = null;
+
+                if ($info !== null && $info['repo'] !== null) {
+                    $releases = filterReleasesInRange(
+                        $allReleases[$info['repo']] ?? [],
+                        $upgrade['from'],
+                        $upgrade['to'],
+                    );
+                    if (empty($releases)) {
+                        $changelogUrl = $changelogUrls[$info['repo']] ?? null;
+                    }
+                }
+
+                $report .= generatePackageDetails($upgrade, $info, $releases, $changelogUrl, $current, $total);
+            }
+        }
+    }
+
+    stderr("\nDone.\n");
+
+    return $report;
+}
+
+function generateSymfonyFrameworkDetails(
+    array $groupUpgrades,
+    string $majorMinor,
+    array $releases,
+    int $total,
+    int $startIndex,
+): string {
+    $allFromVersions = array_column($groupUpgrades, 'from');
+    $allToVersions = array_column($groupUpgrades, 'to');
+
+    usort($allFromVersions, 'version_compare');
+    usort($allToVersions, 'version_compare');
+
+    $maxFrom = end($allFromVersions);
+    $maxTo = end($allToVersions);
+
+    $packageCount = count($groupUpgrades);
+    $startIdx = $startIndex + 1;
+    $endIdx = $startIndex + $packageCount;
+
+    stderr(sprintf("[%d-%d/%d] Symfony %s (%d packages, %s => %s)...", $startIdx, $endIdx, $total, $majorMinor, $packageCount, $maxFrom, $maxTo));
+
+    $section = '<details>' . "\n";
+    $section .= sprintf('<summary><strong>Symfony %s framework</strong> (%s => %s, %d packages)</summary>', $majorMinor, $maxFrom, $maxTo, $packageCount) . "\n\n";
+
+    // List all packages
+    $packageList = array_map(
+        static fn(array $u): string => sprintf('- `%s` (%s => %s)', $u['package'], $u['from'], $u['to']),
+        $groupUpgrades,
+    );
+    $section .= implode("\n", $packageList) . "\n\n";
+
+    if (empty($releases)) {
+        $compareUrl = sprintf('https://github.com/symfony/symfony/compare/v%s...v%s', $maxFrom, $maxTo);
+        $section .= sprintf("[Compare changes on GitHub](%s)\n\n", $compareUrl);
+        stderr(" no releases found\n");
+    } else {
+        foreach ($releases as $release) {
+            $tag = $release['tag_name'];
+            $body = trim($release['body'] ?? '');
+            $body = resolveRelativeUrls($body, 'symfony/symfony', $tag);
+            $url = $release['html_url'] ?? '';
+            $blogVersion = str_replace('.', '-', ltrim($tag, 'v'));
+            $blogUrl = sprintf('https://symfony.com/blog/symfony-%s-released', $blogVersion);
+
+            $section .= sprintf("### %s ([release](%s) · [blog](%s))\n\n", $tag, $url, $blogUrl);
+            $section .= ($body !== '' ? $body : '_No release notes._') . "\n\n";
+        }
+
+        stderr(sprintf(" %d release(s)\n", count($releases)));
+    }
+
+    $section .= "</details>\n\n";
+
+    return $section;
+}
+
+function generatePackageDetails(
+    array $upgrade,
+    ?array $packageInfo,
+    array $releases,
+    ?string $changelogUrl,
+    int $current,
+    int $total,
+): string {
+    $package = $upgrade['package'];
+    $from = $upgrade['from'];
+    $to = $upgrade['to'];
+
+    stderr(sprintf("[%d/%d] %s (%s => %s)...", $current, $total, $package, $from, $to));
+
+    if ($packageInfo === null || $packageInfo['repo'] === null) {
+        stderr(" no GitHub repo found\n");
+
+        return sprintf(
+            "<details>\n<summary><strong>%s</strong> (%s => %s)</summary>\n\n_Could not find GitHub repository for this package._\n\n</details>\n\n",
+            $package,
+            $from,
+            $to,
+        );
+    }
+
+    $repo = $packageInfo['repo'];
+    $tagPrefix = $packageInfo['tagPrefix'];
+
+    $compareUrl = sprintf(
+        'https://github.com/%s/compare/%s%s...%s%s',
+        $repo,
+        $tagPrefix, $from,
+        $tagPrefix, $to,
+    );
+
+    if (empty($releases)) {
+        $links = sprintf("[Compare changes on GitHub](%s)", $compareUrl);
+
+        if ($changelogUrl !== null) {
+            $links .= sprintf(' · [CHANGELOG](%s)', $changelogUrl);
+        }
+
+        stderr(" no releases\n");
+
+        return sprintf(
+            "<details>\n<summary><strong>%s</strong> (%s => %s)</summary>\n\n%s\n\n</details>\n\n",
+            $package,
+            $from,
+            $to,
+            $links,
+        );
+    }
+
+    $releaseCount = count($releases);
+    $content = '';
+
+    foreach ($releases as $release) {
+        $body = trim($release['body'] ?? '');
+        $body = resolveRelativeUrls($body, $repo, $release['tag_name']);
+        $url = $release['html_url'] ?? '';
+
+        $heading = $url !== ''
+            ? sprintf('### [%s](%s)', $release['tag_name'], $url)
+            : sprintf('### %s', $release['tag_name']);
+
+        $content .= $heading . "\n\n";
+        $content .= ($body !== '' ? $body : '_No release notes._') . "\n\n";
+    }
+
+    $content .= sprintf("[Full diff](%s)\n\n", $compareUrl);
+
+    stderr(sprintf(" %d release(s)\n", $releaseCount));
+
+    return sprintf(
+        "<details>\n<summary><strong>%s</strong> (%s => %s) — %d release(s)</summary>\n\n%s</details>\n\n",
+        $package,
+        $from,
+        $to,
+        $releaseCount,
+        $content,
+    );
+}
