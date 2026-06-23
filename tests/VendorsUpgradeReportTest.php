@@ -96,6 +96,57 @@ final class VendorsUpgradeReportTest extends TestCase
         ];
     }
 
+    // === resolveIssueReferences ===
+
+    #[DataProvider('issueReferenceProvider')]
+    public function testResolveIssueReferences(string $markdown, string $expected): void
+    {
+        self::assertSame($expected, resolveIssueReferences($markdown, 'symfony/symfony'));
+    }
+
+    public static function issueReferenceProvider(): iterable
+    {
+        yield 'bare issue reference' => [
+            'Fixed in #6023',
+            'Fixed in [#6023](https://github.com/symfony/symfony/issues/6023)',
+        ];
+
+        yield 'reference in parentheses' => [
+            'Bug fix (#123)',
+            'Bug fix ([#123](https://github.com/symfony/symfony/issues/123))',
+        ];
+
+        yield 'multiple references' => [
+            'See #1 and #2.',
+            'See [#1](https://github.com/symfony/symfony/issues/1) and [#2](https://github.com/symfony/symfony/issues/2).',
+        ];
+
+        yield 'already qualified reference unchanged' => [
+            'See doctrine/orm#123',
+            'See doctrine/orm#123',
+        ];
+
+        yield 'existing markdown link unchanged' => [
+            '[#123](https://github.com/symfony/symfony/pull/123)',
+            '[#123](https://github.com/symfony/symfony/pull/123)',
+        ];
+
+        yield 'numeric html entity unchanged' => [
+            'Tom&#39;s fix',
+            'Tom&#39;s fix',
+        ];
+
+        yield 'hex-like token unchanged' => [
+            'Use #fff for white',
+            'Use #fff for white',
+        ];
+
+        yield 'word-adjacent hash unchanged' => [
+            'See ABC#5 elsewhere',
+            'See ABC#5 elsewhere',
+        ];
+    }
+
     // === parsePackagistResponse ===
 
     public function testParsePackagistResponse(): void

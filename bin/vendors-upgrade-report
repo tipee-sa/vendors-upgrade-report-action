@@ -725,6 +725,34 @@ function resolveRelativeUrls(string $markdown, string $repo, string $tag): strin
     );
 }
 
+/**
+ * Rewrites bare issue/PR references (e.g. "#6023") in release bodies to absolute
+ * links pointing at the source repository.
+ *
+ * GitHub autolinks "#123" to an issue/PR in the repository where the text is
+ * rendered. When release notes from another project are embedded in a PR comment,
+ * those references would resolve to *our* repository instead of the library's, so
+ * we rewrite them to fully-qualified links. The /issues/ URL transparently
+ * redirects to /pull/ when the number refers to a pull request.
+ *
+ * Left untouched: already-qualified references (e.g. "doctrine/orm#123"),
+ * references inside existing markdown links (e.g. "[#123](...)"), numeric HTML
+ * entities (e.g. "&#39;") and hex-like tokens (e.g. "#fff").
+ */
+function resolveIssueReferences(string $markdown, string $repo): string
+{
+    return preg_replace_callback(
+        '/(?<![\w\/&\[])#(\d+)\b/',
+        static fn(array $m): string => sprintf(
+            '[#%s](https://github.com/%s/issues/%s)',
+            $m[1],
+            $repo,
+            $m[1],
+        ),
+        $markdown,
+    );
+}
+
 function generateReport(array $upgrades, ?string $githubToken, string $packageRegistry = 'composer'): string
 {
     // Group upgrades by vendor
@@ -952,6 +980,7 @@ function generateSymfonyFrameworkDetails(
             $tag = $release['tag_name'];
             $body = trim($release['body'] ?? '');
             $body = resolveRelativeUrls($body, 'symfony/symfony', $tag);
+            $body = resolveIssueReferences($body, 'symfony/symfony');
             $url = $release['html_url'] ?? '';
             $blogVersion = str_replace('.', '-', ltrim($tag, 'v'));
             $blogUrl = sprintf('https://symfony.com/blog/symfony-%s-released', $blogVersion);
@@ -1027,6 +1056,7 @@ function generatePackageDetails(
     foreach ($releases as $release) {
         $body = trim($release['body'] ?? '');
         $body = resolveRelativeUrls($body, $repo, $release['tag_name']);
+        $body = resolveIssueReferences($body, $repo);
         $url = $release['html_url'] ?? '';
 
         $heading = $url !== ''
